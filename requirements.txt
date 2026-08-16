@@ -1,0 +1,9 @@
+requests>=2.31
+urllib3>=2.0
+Pillow>=10.0
+beautifulsoup4>=4.12
+Flask>=3.0
+pyperclip>=1.8
+pyautogui>=0.9
+pywin32>=306; platform_system == "Windows"
+selenium>=4.20
