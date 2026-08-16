@@ -17,13 +17,14 @@
 - 微博接口检测到登录失效、请求被拒绝或异常时，后台自动启动浏览器缓存副本并尝试更新 `SUB`。
 - 图形界面实时日志；日志文件按两天滚动清理。
 - 可打包为便携 Windows 程序，并可附带 Chrome 与匹配的 ChromeDriver。
+- 微博会刷新最新5条内容，同时也会抓取博主最新的评论。
 
 ## 运行环境
 
 - Windows 10 / Windows 11（需要图形桌面环境）。
 - Python 3.10+（运行源码时需要）。
 - Google Chrome（建议安装，用于保存你的默认微博登录缓存）。
-- 已配置可用的微信桌面端。
+- 微信随意版本，最新版本也可，唯独需要独立聊天窗口。
 - [NapCatQQ](https://github.com/NapNeko/NapCatQQ)（QQ 消息来源，使用 OneBot 11 HTTP 上报）。
 - 折淘客 AppKey、SID、PID、UnionID（使用转链功能时需要）。
 
@@ -35,7 +36,7 @@ cd <仓库目录>
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python .\qq_wb2(2)(4).py
+python .\qq-weibo-Redirect-link.py
 ```
 
 也可以直接双击 `启动转链机器人.bat`。
@@ -90,11 +91,12 @@ python .\qq_wb2(2)(4).py
 | 微博 Cookie (SUB) | 通常由“从默认 Chrome 缓存获取 SUB”自动写入；仅用于核对或紧急手动粘贴。 |
 | 替换规则 | 每行一条 `原文 => 新文`；右侧留空表示删除原文。 |
 
+
 ## 打包为便携程序
 
 ```powershell
 python -m pip install pyinstaller
-python -m PyInstaller --noconfirm --clean --windowed --onedir --name "QQ微博电商转链机器人" --collect-all selenium --hidden-import=win32timezone .\qq_wb2(2)(4).py
+python -m PyInstaller --noconfirm --clean --windowed --onedir --name "QQ微博电商转链机器人" --collect-all selenium --hidden-import=win32timezone .\qq-weibo-Redirect-link.py
 ```
 
 若需要在未安装 Chrome 的电脑上使用，可将 Chrome 程序目录和与其版本匹配的 `chromedriver.exe` 一同放入打包目录：
@@ -109,20 +111,7 @@ QQ微博电商转链机器人/
 
 若希望读取目标电脑的既有微博登录态，目标电脑仍应安装 Google Chrome，并使用默认用户资料登录微博。
 
-## 数据与安全
 
-以下文件包含个人信息或运行数据，**不要提交到 GitHub**：
-
-```text
-ecommerce_bot_config.json
-ecommerce_bot.log
-weibo_chrome_profile/
-weibo_imgs/
-history_weibo_ids_*.txt
-发布包_*/
-```
-
-发布代码前，请确认其中不含 QQ 群号、微信目标群名、微博 Cookie、折淘客密钥或本地路径。建议创建干净的项目目录后，仅提交源代码、`requirements.txt`、本 README 和 `.gitignore`。
 
 ## 常见问题
 
