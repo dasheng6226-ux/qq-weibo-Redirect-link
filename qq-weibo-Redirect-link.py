@@ -60,12 +60,10 @@ WEIBO_USERS = [
     {"uid": "", "history_file": "history_weibo_ids.txt"},
 ]
 
-SKIP_KEYWORDS = ["加群", "进群", "闲聊",  "花小猪","/passport.weibo", "小牙牙", "淘宝闪购"] 
-QQ_BLACKLIST_KEYWORDS = ["元宝", "可达", "花小猪"] 
+SKIP_KEYWORDS = ["加群", "进群", ] 
+QQ_BLACKLIST_KEYWORDS = [] 
 REPLACE_KEYWORDS = {
-    "评论区": " ","🐶东": " ",
-    "11107": "￥yUBy43h6wTp￥/ HU7405", "26680": "￥yUBy43h6wTp￥/ HU7405",
-    "63166": "￥yUBy43h6wTp￥/ HU7405", "13737": "￥yUBy43h6wTp￥/ HU7405"
+    "评论区": " ",
 }
 MAX_IMAGES_QQ = 3  
 
