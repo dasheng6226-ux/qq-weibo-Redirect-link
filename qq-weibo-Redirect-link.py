@@ -3,6 +3,8 @@ import random
 import re
 import time
 import datetime
+import html as html_lib
+import hashlib
 import locale
 import json
 import logging
@@ -22,7 +24,7 @@ import socket
 import shutil
 from logging.handlers import TimedRotatingFileHandler
 
-from urllib.parse import unquote, urlparse, parse_qs, quote
+from urllib.parse import unquote, urlparse, parse_qs, quote, urljoin
 from io import BytesIO
 from PIL import Image
 from flask import Flask, request, jsonify
@@ -43,11 +45,20 @@ LISTEN_QQ_GROUPS = []
 WEBHOOK_PORT = 5000  
 
 APPKEY = ""
+JD_APPKEY = ""
 SID = ""
 PID = ""
 UNIONID = ""
+JD_POSITION_ID = ""
+# 淘宝联盟官方开放平台（用于折淘客无法生成淘口令的普通/凑单商品）。
+TAOBAO_ALLIANCE_APP_KEY = ""
+TAOBAO_ALLIANCE_APP_SECRET = ""
+TAOBAO_ALLIANCE_SESSION_KEY = ""
+TAOBAO_ALLIANCE_ADZONE_ID = ""
 
 CONVERT_API_TAOBAO = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl_piliang.ashx"
+# 京东使用折京客的批量高佣转链接口。不要换成 materialId/positionId 接口：
+# 后者会拒绝普通商品 SKU（返回“ 不支持数字id转链 ”）。
 CONVERT_API_JD = "http://api.zhetaoke.com:20000/api/open_gaoyongzhuanlian_tkl_piliang.ashx"
 ENABLE_CONVERT_QQ = True  
 
@@ -99,7 +110,9 @@ def parse_replace_rules(value):
 def load_user_config():
     """读取 UI 配置并覆盖默认值；坏配置不会阻止程序启动。"""
     global WECHAT_CHAT_NAME, LISTEN_QQ_GROUPS, WEBHOOK_PORT
-    global APPKEY, SID, PID, UNIONID, WEIBO_COOKIE, WEIBO_COOKIE_JAR, WEIBO_USERS
+    global APPKEY, JD_APPKEY, SID, PID, UNIONID, JD_POSITION_ID
+    global TAOBAO_ALLIANCE_APP_KEY, TAOBAO_ALLIANCE_APP_SECRET, TAOBAO_ALLIANCE_SESSION_KEY, TAOBAO_ALLIANCE_ADZONE_ID
+    global WEIBO_COOKIE, WEIBO_COOKIE_JAR, WEIBO_USERS
     global SKIP_KEYWORDS, QQ_BLACKLIST_KEYWORDS, REPLACE_KEYWORDS, ENABLE_CONVERT_QQ
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
@@ -108,9 +121,15 @@ def load_user_config():
         LISTEN_QQ_GROUPS = [int(x) for x in _split_lines(cfg.get("listen_qq_groups", LISTEN_QQ_GROUPS)) if str(x).isdigit()]
         WEBHOOK_PORT = int(cfg.get("webhook_port", WEBHOOK_PORT))
         APPKEY = str(cfg.get("appkey", APPKEY)).strip()
+        JD_APPKEY = str(cfg.get("jd_appkey", JD_APPKEY)).strip()
         SID = str(cfg.get("sid", SID)).strip()
         PID = str(cfg.get("pid", PID)).strip()
         UNIONID = str(cfg.get("unionid", UNIONID)).strip()
+        JD_POSITION_ID = str(cfg.get("jd_position_id", JD_POSITION_ID)).strip()
+        TAOBAO_ALLIANCE_APP_KEY = str(cfg.get("taobao_alliance_app_key", TAOBAO_ALLIANCE_APP_KEY)).strip()
+        TAOBAO_ALLIANCE_APP_SECRET = str(cfg.get("taobao_alliance_app_secret", TAOBAO_ALLIANCE_APP_SECRET)).strip()
+        TAOBAO_ALLIANCE_SESSION_KEY = str(cfg.get("taobao_alliance_session_key", TAOBAO_ALLIANCE_SESSION_KEY)).strip()
+        TAOBAO_ALLIANCE_ADZONE_ID = str(cfg.get("taobao_alliance_adzone_id", TAOBAO_ALLIANCE_ADZONE_ID)).strip()
         WEIBO_COOKIE = str(cfg.get("weibo_cookie", WEIBO_COOKIE)).strip()
         saved_jar = cfg.get("weibo_cookie_jar", {})
         if isinstance(saved_jar, dict):
@@ -286,17 +305,60 @@ def detect_platform_qq(content_text):
     if any(kw in content_text for kw in ['jd.com', 'item.jd.com', '京东', 'JD']): return 'jd'
     return 'taobao'
 
+CONVERSION_FAILURE_MARKERS = (
+    "转链失败", "转换失败", "生成失败", "未获取到", "未找到", "不支持转链",
+    "商品已下架", "商品不存在", "抱歉", "不能为空", "请求失败", "系统错误",
+)
+
+def _is_conversion_failure_text(value):
+    """识别接口返回的失败提示，避免把错误文案当成转链结果发送。"""
+    if isinstance(value, dict):
+        return any(_is_conversion_failure_text(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_is_conversion_failure_text(item) for item in value)
+    text = str(value or "").strip().lower()
+    if not text or text.startswith(("http://", "https://")):
+        return False
+    return (any(marker.lower() in text for marker in CONVERSION_FAILURE_MARKERS) or
+            bool(re.search(r"\b(?:invalid|failed|failure|error)\b", text)))
+
 def convert_content_with_api_qq(content_text):
     if not content_text: return None, "内容为空"
-    convert_api = CONVERT_API_JD if detect_platform_qq(content_text) == 'jd' else CONVERT_API_TAOBAO
+    if detect_platform_qq(content_text) == 'jd':
+        return convert_jd_links_in_text(content_text)
     try:
-        resp = requests.get(f"{convert_api}?appkey={APPKEY}&sid={SID}&pid={PID}&unionid={UNIONID}&tkl={quote(content_text, safe='')}", timeout=15)
+        resp = requests.get(f"{CONVERT_API_TAOBAO}?appkey={APPKEY}&sid={SID}&pid={PID}&unionid={UNIONID}&tkl={quote(content_text, safe='')}", timeout=15)
         if resp.status_code != 200: return None, f"HTTP错误: {resp.status_code}"
         data = resp.json()
-        if data.get("status") != 200: return None, data.get("msg", "未知错误")
+        if not isinstance(data, dict): return None, "接口返回格式异常"
+        if str(data.get("status")) != "200": return None, data.get("msg", "未知错误")
         converted_content = data.get("content")
-        return str(converted_content) if converted_content else None, "未找到content字段"
+        if not converted_content or _is_conversion_failure_text(converted_content):
+            return None, data.get("msg", "转链失败或未找到content字段")
+        return str(converted_content), ""
     except Exception as e: return None, f"转链异常: {e}"
+
+def convert_jd_links_in_text(content_text):
+    """QQ 文本中的京东链接逐条转为短链，避免误用淘宝通用转链接口。"""
+    url_pattern = re.compile(r"https?://[^\s\u4e00-\u9fa5\"'<>]+", re.IGNORECASE)
+    converted_count = 0
+
+    def replace_link(match):
+        nonlocal converted_count
+        original_url = match.group(0)
+        final_url = get_final_url_weibo(original_url)
+        if not (urlparse(final_url).netloc.lower().endswith("jd.com")):
+            return original_url
+        converted_url = ztk_convert_jd_weibo(final_url)
+        if converted_url:
+            converted_count += 1
+            return converted_url
+        return ""
+
+    converted_text = url_pattern.sub(replace_link, content_text).strip()
+    if not converted_count:
+        return None, "未能将文本中的京东商品链接转换为短链"
+    return converted_text, ""
 
 @app.route('/webhook', methods=['POST'])
 def napcat_webhook():
@@ -517,70 +579,232 @@ def extract_mid(url):
     m = re.search(r'/(?:status|detail)/([a-zA-Z0-9]+)', url) or re.search(r'/\d+/([a-zA-Z0-9]+)', url)
     return m.group(1) if m else None
 
+def _is_jd_union_promotion_url(url):
+    """识别微博/京东联盟已生成的推广链接，不能清掉其归因参数。"""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = parsed.netloc.lower().split(":", 1)[0]
+        if not (host == "item.jd.com" or host.endswith(".jd.com")):
+            return False
+        query = parse_qs(parsed.query)
+        source = " ".join(query.get("utm_source", [])).lower()
+        return bool(
+            query.get("pcdk") and
+            (str(next(iter(query.get("cu", [""])), "")).lower() == "true" or
+             "lianmeng" in source or query.get("utm_campaign"))
+        )
+    except Exception:
+        return False
+
+def purify_ecommerce_url(url):
+    """将淘宝、天猫和普通商品页整理为标准格式；保留已生成的京东推广参数。"""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(str(url).strip())
+        host = parsed.netloc.lower().split(":", 1)[0]
+        query = parse_qs(parsed.query)
+        if host.endswith("taobao.com") or host.endswith("tmall.com"):
+            item_id = next(iter(query.get("id", [])), "")
+            if item_id and ("item.htm" in parsed.path or host.startswith(("item.", "detail."))):
+                return f"https://item.taobao.com/item.htm?id={item_id}"
+        if host == "item.jd.com" or host.endswith(".item.jd.com"):
+            if _is_jd_union_promotion_url(url):
+                return str(url).strip()
+            match = re.search(r"/(\d+)\.html", parsed.path)
+            if match:
+                return f"https://item.jd.com/{match.group(1)}.html"
+        if host.endswith("jd.com"):
+            match = re.search(r"/(?:product/)?(\d+)\.html", parsed.path)
+            item_id = match.group(1) if match else next(
+                (values[0] for key in ("sku", "skuId", "wareId") if (values := query.get(key))), "")
+            if item_id:
+                return f"https://item.jd.com/{item_id}.html"
+    except Exception:
+        pass
+    return str(url).strip()
+
+def _normalize_redirect_url(value, base_url=""):
+    """清洗 HTML、JSON、JS 中提取出的候选跳转链接。"""
+    if value is None:
+        return ""
+    candidate = html_lib.unescape(str(value)).strip().strip("\"'")
+    candidate = candidate.replace("\\/", "/")
+    candidate = re.sub(r"\\u([0-9a-fA-F]{4})",
+                       lambda match: chr(int(match.group(1), 16)), candidate)
+    if re.match(r"^https?%3A", candidate, re.IGNORECASE):
+        candidate = unquote(candidate)
+    candidate = urljoin(base_url or "https://weibo.com/", candidate)
+    return candidate if urlparse(candidate).scheme in ("http", "https") else ""
+
+def _is_ecommerce_bridge_url(url):
+    """这些地址仍是中间跳转页，需要继续还原到真正的商品页。"""
+    try:
+        host = urlparse(url).netloc.lower().split(":", 1)[0]
+        return host in {"shop.sc.weibo.com", "union-click.jd.com"}
+    except Exception:
+        return False
+
+def _is_weibo_shop_item_url(url):
+    """微博商城商品卡：每张卡都是独立商品，不能用正文主商品链接替代。"""
+    try:
+        parsed = urlparse(str(url or ""))
+        return (parsed.netloc.lower().split(":", 1)[0] == "shop.sc.weibo.com" and
+                parsed.path.startswith("/h5/goods/"))
+    except Exception:
+        return False
+
+def _is_ztk_jd_union_click_url(url):
+    """折京客可直接转链的京东联盟中间推广物料，不能继续解析成普通商品页。"""
+    try:
+        parsed = urlparse(str(url or ""))
+        return (
+            parsed.netloc.lower().split(":", 1)[0] == "union-click.jd.com"
+            and parsed.path.lower() in {"/jdc", "/jda"}
+            and bool(parse_qs(parsed.query).get("p"))
+        )
+    except Exception:
+        return False
+
+def _extract_html_redirect_candidates(html_content, base_url):
+    """按可信度顺序提取页面中的 JS、Meta 和 JSON 跳转目标。"""
+    clean_text = html_lib.unescape(str(html_content or "")).replace("\\/", "/")
+    patterns = (
+        r"\b(?:var\s+)?(?:hrl|jump_url|target_url|redirect_url)\s*=\s*['\"]([^'\"]+)",
+        r"(?:window|top|self)?\.?location(?:\.href)?\s*=\s*['\"]([^'\"]+)",
+        r"location\.(?:replace|assign)\(\s*['\"]([^'\"]+)",
+        r"<meta[^>]+http-equiv=['\"]?refresh['\"]?[^>]+content=['\"][^'\"]*?url\s*=\s*([^'\";>]+)",
+        r"['\"](?:jump_url|target_url|redirect_url|url)['\"]\s*:\s*['\"]([^'\"]+)",
+        r"<a[^>]+href=['\"](https?://[^'\"]+)['\"]",
+    )
+    candidates = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, clean_text, re.IGNORECASE):
+            candidate = _normalize_redirect_url(match.group(1), base_url)
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    # 最后再扫描明显的电商绝对链接，避免把图片、脚本等静态资源当跳转目标。
+    for raw_url in re.findall(r"https?://[^\s\"'<>]+", unquote(clean_text), re.IGNORECASE):
+        candidate = _normalize_redirect_url(raw_url.rstrip(");,}"), base_url)
+        if candidate and is_ecommerce_link_weibo(candidate) and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+def _resolve_fragment_api_redirect(html_content, page_url, headers):
+    """兼容 carben/m74 一类“页面锚点 + JSONP 接口”生成真实链接的跳转页。"""
+    fragment = urlparse(page_url).fragment.strip()
+    if not fragment or "location.hash" not in str(html_content or ""):
+        return ""
+    match = re.search(
+        r"(?:var\s+)?url\s*=\s*['\"](https?://[^'\"]+/)['\"]\s*\+\s*window\.location\.hash",
+        str(html_content), re.IGNORECASE)
+    if not match:
+        return ""
+    api_url = _normalize_redirect_url(match.group(1), page_url) + quote(fragment, safe="")
+    try:
+        response = req_session.get(
+            api_url,
+            headers=headers,
+            params={"callback": "weiboRedirectCallback", "domain": urlparse(page_url).hostname or ""},
+            timeout=8,
+        )
+        for candidate in _extract_html_redirect_candidates(response.text, api_url):
+            if candidate:
+                return candidate
+    except requests.RequestException:
+        pass
+    return ""
+
 def get_final_url_weibo(initial_url):
-    """解析真实重定向链接，强拆微博 sinaurl 外壳放行第三方福利链"""
-    if not initial_url: return ""
-    current_url = initial_url.strip()
+    """逐层拆解微博外壳、第三方活动页和联盟跳转，尽量返回标准商品链接。"""
+    if not initial_url:
+        return ""
+    current_url = _normalize_redirect_url(initial_url, "https://weibo.com/")
+    if not current_url:
+        return ""
     pc_headers = get_pc_headers()
-    for _ in range(5):
+    visited = set()
+    for _ in range(8):
+        if current_url in visited:
+            break
+        visited.add(current_url)
+
+        # 先解微博 sinaurl 等把真实地址放在查询参数中的外壳；外部活动页仍要继续请求分析。
         try:
             qs = parse_qs(urlparse(current_url).query)
             for key in ['url', 'u', 'target', 'jump', 'to']:
-                if key in qs:
-                    decoded = unquote(qs[key][0])
-                    decoded = 'https:' + decoded if decoded.startswith('//') else ('https://' + decoded.lstrip('/') if not decoded.startswith('http') else decoded)
-                    if is_ecommerce_link_weibo(decoded) or is_weibo_article_link(decoded): return decoded
-                    
-                    # 【核心修复1】只要是提取出的纯外部链接（如 carben.me），直接解绑放行！
-                    if "weibo" not in decoded and "sina" not in decoded:
-                        return decoded
-        except: pass
+                if key not in qs:
+                    continue
+                decoded = _normalize_redirect_url(qs[key][0], current_url)
+                if decoded and decoded != current_url:
+                    current_url = decoded
+                    break
+            else:
+                decoded = ""
+            if decoded:
+                if ((is_ecommerce_link_weibo(current_url) and not _is_ecommerce_bridge_url(current_url)) or
+                        is_weibo_article_link(current_url)):
+                    return purify_ecommerce_url(current_url)
+                continue
+        except Exception:
+            pass
 
-        if is_ecommerce_link_weibo(current_url): return current_url
+        if is_ecommerce_link_weibo(current_url) and not _is_ecommerce_bridge_url(current_url):
+            return purify_ecommerce_url(current_url)
 
         try:
             resp = req_session.get(current_url, headers=pc_headers, timeout=8, allow_redirects=True)
-            current_url = resp.url 
-            
+            requested_url = current_url
+            current_url = _normalize_redirect_url(resp.url, requested_url) or requested_url
+
             if "passport.weibo.com" in current_url:
                 qs = parse_qs(urlparse(current_url).query)
                 if 'url' in qs:
-                    extracted = unquote(qs['url'][0])
-                    extracted = 'https://' + extracted.lstrip('/') if not extracted.startswith('http') else extracted
-                    if is_ecommerce_link_weibo(extracted) or is_weibo_article_link(extracted): return extracted
-                    # 【核心修复1补充】同理，登录墙里拦截的第三方链接也直接放行
-                    if "weibo" not in extracted and "sina" not in extracted: return extracted
-                    current_url = extracted
-                break 
-            
-            if is_ecommerce_link_weibo(current_url) or is_weibo_article_link(current_url): return current_url
-            
-            html_content = resp.text
-            patterns = [
-                r'var\s+url\s*=\s*[\'"](https?://[^\'"]+\.(tmall|taobao|jd)\.com[^\'"]*)[\'"]',
-                r'window\.location\.href\s*=\s*[\'"](https?://[^\'"]+\.(tmall|taobao|jd)\.com[^\'"]*)[\'"]',
-                r'<meta[^>]*url=(https?://[^>"]+\.(tmall|taobao|jd)\.com[^>"]*)',
-                r'<a[^>]*href="?(https?://[^>"]+\.(tmall|taobao|jd)\.com[^>"]*)"?',
-                r'"jump_url"\s*:\s*"([^"]+)"'
-            ]
-            found_in_html = False
-            for p in patterns:
-                m = re.search(p, html_content, re.IGNORECASE)
-                if m:
-                    extracted = m.group(1).replace('\\/', '/')
-                    if '\\u' in extracted: extracted = extracted.encode('utf-8').decode('unicode_escape')
-                    if is_ecommerce_link_weibo(extracted): return extracted
-                    current_url = extracted
-                    found_in_html = True
-                    break
-            
-            if not found_in_html:
-                clean_text = unquote(html_content).replace('\\/', '/')
-                for u in re.findall(r'(https?://[a-zA-Z0-9\-\.\/\?\&\=\%\_\#]+)', clean_text):
-                    if is_ecommerce_link_weibo(u): return u
+                    extracted = _normalize_redirect_url(qs['url'][0], current_url)
+                    if extracted:
+                        current_url = extracted
+                        continue
                 break
-        except: break
-    return current_url
+
+            # 微博商城的 shop.sc 链会落到 union-click/jdc；这是折京客实际可转的
+            # 推广物料，继续追踪会退化为普通 item.jd.com 数字商品页而被接口拒绝。
+            if _is_ztk_jd_union_click_url(current_url):
+                return current_url
+
+            if is_weibo_article_link(current_url):
+                return current_url
+
+            # 请求已完成京东联盟跳转时，resp.url 携带 pcdk/utm 等推广归因。
+            # 必须优先返回它，不能再从商品 HTML 中捡到无参数的普通商品链接。
+            if is_ecommerce_link_weibo(current_url) and not _is_ecommerce_bridge_url(current_url):
+                return purify_ecommerce_url(current_url)
+
+            html_content = resp.text
+            if fragment_target := _resolve_fragment_api_redirect(html_content, requested_url, pc_headers):
+                current_url = fragment_target
+                continue
+
+            next_url = ""
+            for candidate in _extract_html_redirect_candidates(html_content, current_url):
+                if candidate in visited:
+                    continue
+                if is_ecommerce_link_weibo(candidate) and not _is_ecommerce_bridge_url(candidate):
+                    return purify_ecommerce_url(candidate)
+                if not next_url:
+                    next_url = candidate
+            if next_url:
+                current_url = next_url
+                continue
+
+            if is_ecommerce_link_weibo(current_url):
+                return purify_ecommerce_url(current_url)
+            if current_url == requested_url:
+                break
+        except requests.RequestException:
+            break
+        except Exception:
+            break
+    return purify_ecommerce_url(current_url)
 
 def get_better_url(mblog):
     page_info = mblog.get('page_info', {})
@@ -606,16 +830,8 @@ def weibo_keep_alive_worker():
 
 
 def purify_taobao_url(url):
-    """淘宝/天猫纯商品链接净化器：精准剥离尾巴，避免报错"""
-    if not url: return url
-    if "detail.tmall.com/item.htm" in url or "item.taobao.com/item.htm" in url:
-        try:
-            qs = parse_qs(urlparse(url).query)
-            if 'id' in qs:
-                return f"https://item.taobao.com/item.htm?id={qs['id'][0]}"
-        except Exception:
-            pass
-    return url
+    """兼容旧调用名称，实际同时净化淘宝、天猫和京东商品链接。"""
+    return purify_ecommerce_url(url)
 
 
 def _extract_taokouling(value):
@@ -676,24 +892,198 @@ def _get_first_http_url(payload):
             return match.group(0)
     return ""
 
+def _extract_jd_sku_id(url):
+    """从已还原的京东商品页或参数中提取 SKU，供京东专用转链接口使用。"""
+    try:
+        parsed = urlparse(str(url or ""))
+        match = re.search(r"/(\d+)\.html", parsed.path)
+        if match:
+            return match.group(1)
+        query = parse_qs(parsed.query)
+        for key in ("sku", "skuId", "wareId", "wareid", "id"):
+            values = query.get(key, [])
+            if values and str(values[0]).isdigit():
+                return str(values[0])
+    except Exception:
+        pass
+    return ""
+
+def ztk_convert_jd_weibo(url):
+    """通过已验证的折京客批量接口转京东商品链接；失败时不回传原链接。"""
+    canonical_url = purify_ecommerce_url(url)
+    is_union_click_material = _is_ztk_jd_union_click_url(canonical_url)
+    if not canonical_url or (not is_union_click_material and not _extract_jd_sku_id(canonical_url)):
+        print(f"  ⚠️ 无法还原京东商品链接，已跳过：{url}")
+        return ""
+    # 微博商城链会经 union-click 跳到已带京东联盟归因参数的商品页。
+    # 这已经是可推广的链接，重新调用折京客反而会失败或丢失归因；
+    # 但发送端必须是短链，短链服务不可用时按用户要求留空。
+    if _is_jd_union_promotion_url(canonical_url):
+        short_url = ztk_short_url_weibo(canonical_url)
+        if _is_jd_short_url(short_url):
+            return short_url
+        print("  ⚠️ 京东推广链接短链生成失败，已跳过发送。")
+        return ""
+    try:
+        # 该接口使用 tkl + 淘宝 PID/SID 这套兼容参数；不能改为 materialId/positionId。
+        response = req_session.post(
+            CONVERT_API_JD,
+            data={"appkey": JD_APPKEY or APPKEY, "unionId": UNIONID,
+                  "pid": PID, "sid": SID, "tkl": quote(canonical_url)},
+            timeout=8,
+        )
+        data = response.json()
+        if not isinstance(data, dict):
+            print("  ⚠️ 京东转链失败：接口返回格式异常")
+            return ""
+        if _is_conversion_failure_text(data) or str(data.get("status", "200")) != "200":
+            reason = data.get("content") or data.get("msg") or data.get("message") or "接口拒绝转链"
+            print(f"  ⚠️ 京东转链失败：{reason}")
+            return ""
+
+        converted = _extract_jd_short_url(data)
+        if not converted:
+            converted = str(data.get("result_url") or data.get("short_url") or _get_first_http_url(data) or "").strip()
+        if not converted or purify_ecommerce_url(converted) == canonical_url:
+            print("  ⚠️ 京东转链失败：接口未返回有效推广链接")
+            return ""
+
+        # 接口偶尔返回较长推广链接；发送端只接受真正的京东短链。
+        if not _is_jd_short_url(converted):
+            short_url = ztk_short_url_weibo(converted)
+            if _is_jd_short_url(short_url):
+                return short_url
+            print("  ⚠️ 京东推广链接短链生成失败，已跳过发送。")
+            return ""
+        return converted
+    except Exception as exc:
+        print(f"  ⚠️ 京东转链异常：{exc}")
+        return ""
+
+TAOBAO_TOP_API = "https://eco.taobao.com/router/rest"
+
+def _taobao_top_request(method, params):
+    """调用淘宝开放平台 TOP API（MD5 签名）。"""
+    if not (TAOBAO_ALLIANCE_APP_KEY and TAOBAO_ALLIANCE_APP_SECRET):
+        return {}
+    payload = {
+        "method": method,
+        "app_key": TAOBAO_ALLIANCE_APP_KEY,
+        "sign_method": "md5",
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "format": "json",
+        "v": "2.0",
+        **{key: str(value) for key, value in params.items() if value not in (None, "")},
+    }
+    if TAOBAO_ALLIANCE_SESSION_KEY:
+        payload["session"] = TAOBAO_ALLIANCE_SESSION_KEY
+    sign_text = TAOBAO_ALLIANCE_APP_SECRET + "".join(
+        f"{key}{payload[key]}" for key in sorted(payload)
+    ) + TAOBAO_ALLIANCE_APP_SECRET
+    payload["sign"] = hashlib.md5(sign_text.encode("utf-8")).hexdigest().upper()
+    try:
+        response = req_session.post(TAOBAO_TOP_API, data=payload, timeout=12)
+        data = response.json()
+        if not isinstance(data, dict):
+            return {}
+        error = data.get("error_response")
+        if isinstance(error, dict):
+            code = error.get("sub_code") or error.get("code") or "unknown_error"
+            message = error.get("sub_msg") or error.get("msg") or "调用失败"
+            print(f"Taobao Alliance {method} failed: {code} - {message}")
+        return data
+    except Exception as exc:
+        print(f"Taobao Alliance {method} request error: {exc}")
+        return {}
+
+def _extract_taobao_item_id(url):
+    try:
+        query = parse_qs(urlparse(str(url or "")).query)
+        item_id = next(iter(query.get("id", [])), "")
+        return str(item_id) if str(item_id).isdigit() else ""
+    except Exception:
+        return ""
+
+def _taobao_alliance_universal_convert(url):
+    """淘宝联盟万能转链：直接把淘宝/Tmall 原始链接转换为短淘口令。"""
+    if not TAOBAO_ALLIANCE_ADZONE_ID.isdigit():
+        return ""
+    converted = _taobao_top_request("taobao.tbk.dg.general.link.convert", {
+        "biz_scene_id": "1",
+        "adzone_id": TAOBAO_ALLIANCE_ADZONE_ID,
+        "material_list": url,
+        "required_link_type": "coupon_short_tpwd,cps_short_tpwd",
+    })
+    response = converted.get("tbk_dg_general_link_convert_response", {})
+    data = response.get("data", {}) if isinstance(response, dict) else {}
+    material_group = data.get("material_url_list", {}) if isinstance(data, dict) else {}
+    materials = material_group.get("material_url_list", []) if isinstance(material_group, dict) else []
+    if isinstance(materials, dict):
+        materials = [materials]
+    for material in materials:
+        if not isinstance(material, dict):
+            continue
+        link_info = material.get("link_info_dto", {})
+        if not isinstance(link_info, dict):
+            continue
+        for key in ("coupon_short_tpwd", "cps_short_tpwd", "coupon_full_tpwd", "cps_full_tpwd"):
+            token = _extract_taokouling(link_info.get(key))
+            if token:
+                return token
+    return ""
+
+def taobao_alliance_convert_weibo(url):
+    """官方淘宝联盟：优先万能转链，必要时再走商品 ID 转链。"""
+    universal_token = _taobao_alliance_universal_convert(url)
+    if universal_token:
+        return universal_token
+    item_id = _extract_taobao_item_id(url)
+    if not (item_id and TAOBAO_ALLIANCE_ADZONE_ID.isdigit()):
+        return ""
+    converted = _taobao_top_request("taobao.tbk.item.convert", {
+        "adzone_id": TAOBAO_ALLIANCE_ADZONE_ID,
+        "fields": "num_iid,click_url",
+        "num_iids": item_id,
+        "platform": "2",
+        "dx": "1",
+    })
+    response = converted.get("tbk_item_convert_response", {})
+    result = response.get("results", {}).get("n_tbk_item", []) if isinstance(response, dict) else []
+    if isinstance(result, dict):
+        result = [result]
+    click_url = next((str(item.get("click_url", "")) for item in result if isinstance(item, dict) and item.get("click_url")), "")
+    if not click_url:
+        return ""
+    token_response = _taobao_top_request("taobao.tbk.tpwd.create", {"url": click_url, "text": "活动福利"})
+    token_data = token_response.get("tbk_tpwd_create_response", {}).get("data", {})
+    return _extract_taokouling(token_data.get("password_simple") or token_data.get("model"))
+
 def ztk_convert_single_weibo(url):
-    """将微博中的商品链接转换为口令；淘宝失败时禁止回退成长链接。"""
+    """将微博中的商品链接转换为口令或京东短链；任何失败都返回空字符串。"""
     if not url:
         return ""
     url = purify_taobao_url(str(url).strip())
+    # 未还原的微博商城商品卡不能原样转发，更不能使用正文主商品链接代替。
+    if _is_weibo_shop_item_url(url):
+        print(f"  ⚠️ 微博商城商品卡未还原，已跳过：{url}")
+        return ""
     if not is_ecommerce_link_weibo(url):
         return url
     host = urlparse(url).netloc.lower()
     is_taobao = any(host == d or host.endswith("." + d) for d in ("taobao.com", "tmall.com", "tb.cn")) or \
         any(x in host for x in ("starlink", "uland.taobao.com", "s.click.taobao.com"))
     is_jd = host == "jd.com" or host.endswith(".jd.com")
-    api_url = CONVERT_API_JD if is_jd else CONVERT_API_TAOBAO
+    if is_jd:
+        return ztk_convert_jd_weibo(url)
     try:
         # requests 会自行进行表单编码；此前先 quote 导致部分链接被双重编码。
-        resp = req_session.post(api_url, data={"appkey": APPKEY, "unionId": UNIONID,
+        resp = req_session.post(CONVERT_API_TAOBAO, data={"appkey": APPKEY, "unionId": UNIONID,
                                                 "pid": PID, "sid": SID, "tkl": url}, timeout=8)
         data = resp.json()
-        if str(data.get("status", "200")) != "200" or "抱歉" in str(data) or "不能为空" in str(data):
+        if not isinstance(data, dict):
+            data = {}
+        status = str(data.get("status", "200"))
+        if status != "200" or _is_conversion_failure_text(data):
             data = {}
         if is_taobao:
             for key in ("taokouling", "tkl", "result_tkl", "content", "model"):
@@ -704,30 +1094,36 @@ def ztk_convert_single_weibo(url):
             try:
                 fallback = req_session.get("https://api.zhetaoke.com:10001/api/open_tkl_create.ashx",
                                            params={"appkey": APPKEY, "url": target_url, "text": "活动福利"}, timeout=5).json()
+                if not isinstance(fallback, dict) or _is_conversion_failure_text(fallback):
+                    fallback = {}
                 for key in ("content", "tkl", "model", "taokouling"):
                     token = _extract_taokouling(fallback.get(key))
                     if token:
                         return token
             except Exception:
                 pass
-            # 关键保证：不再返回淘宝/天猫长链接或短链。
-            return "[淘宝转链失败：未获取到淘口令]"
-        # 京东必须输出短链：先找转链接口明确返回的短链，再将联盟长链交给短链接口。
-        if short_url := _extract_jd_short_url(data):
-            return short_url
-        affiliate_url = (data.get("result_url") or data.get("click_url") or
-                         data.get("coupon_url") or _get_first_http_url(data) or url)
-        shortened = ztk_short_url_weibo(affiliate_url)
-        if _is_jd_short_url(shortened) or (shortened.startswith("http") and len(shortened) <= 80):
-            return shortened
-        return "[京东转链失败：未获取到短链]"
-    except Exception:
-        return "[商品转链失败]" if is_taobao else "[京东转链失败]"
+            # 折淘客无法生成淘口令时，才调用淘宝联盟官方接口兜底。
+            official_token = taobao_alliance_convert_weibo(url)
+            if official_token:
+                print("  ✅ 折淘客未返回淘口令，已使用淘宝联盟官方接口生成淘口令。")
+                return official_token
+            return ""
+        return ""
+    except Exception as exc:
+        if is_taobao:
+            print(f"  ⚠️ 折淘客淘宝转链异常，尝试淘宝联盟官方接口：{exc}")
+            official_token = taobao_alliance_convert_weibo(url)
+            if official_token:
+                print("  ✅ 已使用淘宝联盟官方接口生成淘口令。")
+                return official_token
+        return ""
 
 def ztk_short_url_weibo(long_url):
     try:
         payload = req_session.get("https://api.zhetaoke.com:10001/api/open_dwz.ashx",
                                   params={"appkey": APPKEY, "url": long_url}, timeout=5).json()
+        if not isinstance(payload, dict) or _is_conversion_failure_text(payload):
+            return ""
         for key in ("short_url", "shortURL", "shortUrl", "url"):
             if isinstance(payload, dict) and isinstance(payload.get(key), str) and payload[key].startswith("http"):
                 return payload[key]
@@ -737,7 +1133,7 @@ def ztk_short_url_weibo(long_url):
                 return match.group(0)
     except Exception:
         pass
-    return long_url
+    return ""
 
 def extract_text_and_links_ordered(html):
     soup = BeautifulSoup(html, 'html.parser')
@@ -786,8 +1182,9 @@ def process_comment_content(html, author_uid, better_url=""):
             if "weibo.cn/search" in href or href.startswith("/n/"): continue
 
             final_link = get_final_url_weibo(href)
-            if not is_ecommerce_link_weibo(final_link) and better_url and (
-                    "apps.weibo.com" in href or "shop.sc.weibo.com" in href):
+            # 正文卡片可回退为 page_info 主链接；微博商城凑单卡必须保持独立，
+            # 否则网络波动时会把凑单商品错误转成正文第一件商品。
+            if not is_ecommerce_link_weibo(final_link) and better_url and "apps.weibo.com" in href:
                 final_link = better_url
 
             if is_weibo_article_link(final_link):
@@ -838,8 +1235,8 @@ def process_weibo_content(mblog, author_uid, level=0, visited_mids=None, skip_re
             if "weibo.cn/search" in href or href.startswith("/n/"): continue
 
             final_link = get_final_url_weibo(href)
-            if not is_ecommerce_link_weibo(final_link) and better_url and (
-                    "apps.weibo.com" in href or "shop.sc.weibo.com" in href):
+            # 每个微博商城凑单卡对应独立商品，禁止回退到正文主商品链接。
+            if not is_ecommerce_link_weibo(final_link) and better_url and "apps.weibo.com" in href:
                 final_link = better_url
 
             if is_weibo_article_link(final_link):
@@ -892,7 +1289,12 @@ def process_message_queue_worker():
 
                 final_text = content_clean
                 if ENABLE_CONVERT_QQ and content_clean:
-                    if converted_text := convert_content_with_api_qq(content_clean)[0]: final_text = converted_text
+                    converted_text, convert_error = convert_content_with_api_qq(content_clean)
+                    final_text = converted_text or ""
+                    if not converted_text:
+                        print(f"  ⚠️ QQ 商品转链失败，文本已置空：{convert_error}")
+                if not final_text and not image_urls:
+                    continue
 
                 print(f"  -> [队列执行] 准备发送 QQ 来源图文...")
                 send_compound_msg_to_wechat(final_text, url_images=image_urls)
@@ -1156,7 +1558,12 @@ def write_user_config(extra=None):
         "wechat_chat_name": WECHAT_CHAT_NAME,
         "listen_qq_groups": LISTEN_QQ_GROUPS,
         "webhook_port": WEBHOOK_PORT,
-        "appkey": APPKEY, "sid": SID, "pid": PID, "unionid": UNIONID,
+        "appkey": APPKEY, "jd_appkey": JD_APPKEY, "sid": SID, "pid": PID, "unionid": UNIONID,
+        "jd_position_id": JD_POSITION_ID,
+        "taobao_alliance_app_key": TAOBAO_ALLIANCE_APP_KEY,
+        "taobao_alliance_app_secret": TAOBAO_ALLIANCE_APP_SECRET,
+        "taobao_alliance_session_key": TAOBAO_ALLIANCE_SESSION_KEY,
+        "taobao_alliance_adzone_id": TAOBAO_ALLIANCE_ADZONE_ID,
         "weibo_cookie": WEIBO_COOKIE,
         "weibo_cookie_jar": WEIBO_COOKIE_JAR,
         "weibo_users": WEIBO_USERS,
@@ -1261,12 +1668,19 @@ def launch_ui():
         text_field(replace_tab, "替换规则", "\n".join(f"{old} => {new}" for old, new in REPLACE_KEYWORDS.items()), 12)
         ttk.Label(replace_tab, text="每行一条：原文 => 新文。右侧留空即可删除原文；规则会在微博内容转发前按顺序应用。", foreground="#8a4b08").pack(padx=10, pady=8, anchor="w")
         field(credential, "折淘客 AppKey", APPKEY)
+        field(credential, "折京客 AppKey", JD_APPKEY)
         field(credential, "折淘客 SID", SID)
-        field(credential, "折淘客 PID", PID)
+        field(credential, "淘宝推广位 PID", PID)
         field(credential, "折淘客 UnionID", UNIONID)
+        field(credential, "京东推广位 ID（数字）", JD_POSITION_ID)
+        field(credential, "淘宝联盟 AppKey", TAOBAO_ALLIANCE_APP_KEY)
+        field(credential, "淘宝联盟 AppSecret", TAOBAO_ALLIANCE_APP_SECRET, show="*")
+        field(credential, "淘宝联盟 SessionKey（可选）", TAOBAO_ALLIANCE_SESSION_KEY, show="*")
+        field(credential, "淘宝联盟推广位 ID", TAOBAO_ALLIANCE_ADZONE_ID)
         field(credential, "微博 Cookie (SUB)", WEIBO_COOKIE)
     def save(show_message=True):
-        global WECHAT_CHAT_NAME, LISTEN_QQ_GROUPS, WEBHOOK_PORT, APPKEY, SID, PID, UNIONID
+        global WECHAT_CHAT_NAME, LISTEN_QQ_GROUPS, WEBHOOK_PORT, APPKEY, JD_APPKEY, SID, PID, UNIONID, JD_POSITION_ID
+        global TAOBAO_ALLIANCE_APP_KEY, TAOBAO_ALLIANCE_APP_SECRET, TAOBAO_ALLIANCE_SESSION_KEY, TAOBAO_ALLIANCE_ADZONE_ID
         global WEIBO_COOKIE, QQ_BLACKLIST_KEYWORDS, SKIP_KEYWORDS, REPLACE_KEYWORDS, WEIBO_USERS
         WECHAT_CHAT_NAME = val("微信目标群名")
         LISTEN_QQ_GROUPS = [int(x) for x in _split_lines(val("QQ源QQ群号")) if x.isdigit()]
@@ -1276,7 +1690,13 @@ def launch_ui():
         REPLACE_KEYWORDS = parse_replace_rules(val("替换规则"))
         WEIBO_USERS = [{"uid": uid, "history_file": f"history_weibo_ids_{uid}.txt"}
                        for uid in _split_lines(val("微博用户UID"))]
-        APPKEY, SID, PID, UNIONID = (val(k) for k in ("折淘客 AppKey", "折淘客 SID", "折淘客 PID", "折淘客 UnionID"))
+        APPKEY, SID, PID, UNIONID = (val(k) for k in ("折淘客 AppKey", "折淘客 SID", "淘宝推广位 PID", "折淘客 UnionID"))
+        JD_APPKEY = val("折京客 AppKey")
+        JD_POSITION_ID = val("京东推广位 ID（数字）")
+        TAOBAO_ALLIANCE_APP_KEY = val("淘宝联盟 AppKey")
+        TAOBAO_ALLIANCE_APP_SECRET = val("淘宝联盟 AppSecret")
+        TAOBAO_ALLIANCE_SESSION_KEY = val("淘宝联盟 SessionKey（可选）")
+        TAOBAO_ALLIANCE_ADZONE_ID = val("淘宝联盟推广位 ID")
         cookie = val("微博 Cookie (SUB)")
         if cookie and not update_cookie(cookie):
             raise ValueError("Cookie 中未找到 SUB=...")
